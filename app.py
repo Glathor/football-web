@@ -1,26 +1,25 @@
 from flask import Flask, render_template, redirect, request
-import spreadsheetdriveapi as drive
-
 import DBDataReader as dbr
 import dbDataWriter as dbw
-
 import datetime as dt
-
 import re
-
 import dbconnect as db
-
+import requests
+import os
+import spreadsheet as ss
 from html5print import HTMLBeautifier
-
 from werkzeug.contrib.fixers import ProxyFix
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
+
+sched = BackgroundScheduler()
+sched.start()
 
 dataSheet = None
 data = None
 
-FILELINK = 'https://docs.google.com/spreadsheets/d/1QH-AFYHk3lXJf-dG3FzhDwtO6iJZus7ZXWoY8aBs7ZI/edit#gid=1350957595'
-GAUTH = None
+FILELINK = 'https://docs.google.com/spreadsheets/d/1QH-AFYHk3lXJf-dG3FzhDwtO6iJZus7ZXWoY8aBs7ZI/edit?usp=sharing'
 
 
 def get_default_request_string():
@@ -31,21 +30,14 @@ def get_default_request_string():
 
     return request_str
 
-
-def google_authentication_init():
-    global GAUTH
-    GAUTH = drive.google_auth_init()
-
-
 def admin_form_requester():
     login = request.form['login']
     password = request.form['password']
-    code = request.form['code']
 
-    return login, password, code
+    return login, password
 
 
-def admin_form_checker(login, password, code):
+def admin_form_checker(login, password):
     user_lists = db.getWebServiceUsers()
 
     for user in user_lists:
@@ -59,46 +51,42 @@ def admin_form_checker(login, password, code):
 
 @app.route("/update")
 def login_in_update():
-    google_authentication_init()
-    google_authentication_redirect = GAUTH.GetAuthUrl()
-    return render_template('auth.html', google_auth_link=google_authentication_redirect)
+    return render_template('auth.html')
 
 
 @app.route("/update", methods=['POST'])
 def get_login_info_update():
-    global data, dataSheet, GAUTH
+    global data, dataSheet
 
-    login, password, code = admin_form_requester()
-    drive.oauth_authenticate(GAUTH, code)
+    login, password = admin_form_requester()
+    ss.download_sheet()
 
-    if admin_form_checker(login, password, code):
-        dataSheet = drive.downloadxlsx('Football-bigdata-v0.2', GAUTH)
+    if admin_form_checker(login, password):
         data = dbw.updatePlayersStats('data/spreadsheets/Football-bigdata-v0.2.xlsx')
         return redirect("/stats")
 
 
 @app.route("/create")
 def login_in_create():
-    google_authentication_init()
-    google_authentication_redirect = GAUTH.GetAuthUrl()
-    return render_template('auth.html', google_auth_link=google_authentication_redirect)
+    return render_template('auth.html')
 
 
 @app.route("/create", methods=['POST'])
 def get_login_info():
-    global data, dataSheet, GAUTH
+    global data, dataSheet
 
-    login, password, code = admin_form_requester()
-    drive.oauth_authenticate(GAUTH, code)
+    login, password = admin_form_requester()
+    ss.download_sheet()
 
-    if admin_form_checker(login, password, code):
-        dataSheet = drive.downloadxlsx('Football-bigdata-v0.2', GAUTH)
+    if admin_form_checker(login, password):
         data = dbw.getAllPlayersStats('data/spreadsheets/Football-bigdata-v0.2.xlsx')
         return redirect("/stats")
 
 
 @app.route('/stats')
 def get_stats_table():
+    global FILELINK
+
     try:
         start = (request.args['start'])
         end = (request.args['end'])
@@ -124,8 +112,9 @@ def get_stats_table():
 
     if (re.match('[\d][\d]/[\d][\d][\d][\d]', start) is not None) \
             and (re.match('[\d][\d]/[\d][\d][\d][\d]', end) is not None):
-        return HTMLBeautifier.beautify(render_template('table.html', table=table_html, years=years, start=start, end=end,
-                           last_player_before_losers=last_player_before_losers, actual_date=actual_date, source_file=FILELINK), 4)
+        return HTMLBeautifier.beautify(render_template('table.html', table=table_html, years=years, start=start,
+                                                       end=end, last_player_before_losers=last_player_before_losers,
+                                                       actual_date=actual_date, source_file=FILELINK), 4)
 
 
 @app.route("/stats", methods=['POST'])
@@ -157,12 +146,18 @@ def get_player_stats():
     player_achievments = dbr.getPlayerAchievements(player_id)
     table_html = dataDB.to_html(classes='playertable')
     table_html = re.sub('dataframe ', '', table_html)
-    return render_template('playerstat.html', table=table_html, player_name=player_name, playerachievments= player_achievments)
+    return render_template('playerstat.html', table=table_html, player_name=player_name,
+                           playerachievments= player_achievments)
 
 
 @app.route("/howitcalc")
 def how_it_calc_page():
     return render_template('howitcalc.html')
+
+
+@app.route("/refresh")
+def refresh_heroku_dynos():
+    return "Heroku Anti Sleep page, yeah!"
 
 
 @app.errorhandler(500)
@@ -195,9 +190,15 @@ def index():
     return redirect(request_str)
 
 
+@app.route("/error")
+def get_error_page():
+    return render_template('sadsanya.html')
+
+
+
 @app.before_first_request
 def check_db_existence():
-    if not db.db_existence_checker('yksc2nhvbiqhmiow'):
+    if not db.db_existence_checker("nsru3v5twni2opge"):
         db.create_db()
 
 
@@ -207,6 +208,26 @@ def add_header(response):
     response.headers['Cache-Control'] = 'public, max-age=0'
     return response
 
+    
+@sched.scheduled_job('interval', minutes=20)
+def web_proc_anti_sleep_handler_and_update():
+    r = requests.get('https://football-web.herokuapp.com/refresh', timeout=20)
+
+    abs_path = os.path.abspath("data/spreadsheets/Football-bigdata-v0.2.xlsx")
+    file_old = abs_path + '.old'
+    file_new = abs_path
+
+    os.rename(file_new, file_old)
+    ss.download_sheet(file_name=file_new)
+
+    if not ss.diff_xlsx(file_old, file_new):
+        dbw.updatePlayersStats(file_new)
+        print('Statistics was updated')
+
+    else:
+        print('Nothing to update')
+
+    os.remove(file_old)
 
 app.wsgi_app = ProxyFix(app.wsgi_app)
 if __name__ == '__main__':
